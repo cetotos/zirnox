@@ -1,18 +1,42 @@
--- zirnox.lua — keep-the-UI version, host bugs fixed
--- OpenComputers 1.7.10 (OpenOS)
--- Reads Zirnox via per-field getters; toggle works; nil-safe; no flicker.
+-- zirnox.lua — same UI, fixed touch + full wireless host/viewer
+-- OpenComputers (1.7.10 / OpenOS)
 
 local component = require("component")
 local event     = require("event")
 local term      = require("term")
+local serial    = require("serialization")
 local gpu       = assert(component.gpu, "GPU required.")
 
--- ---------- small nil-safe helpers ----------
+-- ========================= Config =========================
+local CFG = {
+  PORT           = 42420,
+  PROTO          = "zirnox.v1",
+  SHARED_KEY     = nil,      -- set same string on both if you want pairing
+  WIRELESS_RANGE = 220,      -- your range
+  TICK           = 0.25,     -- logic tick
+  BCAST_RATE     = 0.5,      -- host broadcast cadence (s)
+  DISC_RATE      = 2.5,      -- viewer discovery cadence (s)
+}
+
+-- Optional CLI: --hostaddr=xxxx-... to lock the viewer to a host
+local LOCK_HOST = nil
+do
+  local ok, shell = pcall(require, "shell")
+  if ok and shell and shell.parse then
+    local _, opts = shell.parse(...)
+    if opts.hostaddr then LOCK_HOST = tostring(opts.hostaddr) end
+  end
+end
+
+-- ========================= Small utils ====================
 local function N(v) return tonumber(v) or 0 end
 local function B(v) return v == true end
+local function wrap(body)
+  return serial.serialize({proto=CFG.PROTO, key=CFG.SHARED_KEY, body=body})
+end
 
--- ---------- resolution & colors ----------
-gpu.setResolution(60, 18)            -- same footprint you liked
+-- ========================= UI helpers (keep your look) ====
+gpu.setResolution(60, 18)  -- same footprint you liked
 local W, H = gpu.getResolution()
 
 local PAD_X, PAD_Y = 2, 2
@@ -32,7 +56,6 @@ local COL = {
   cyan  = 0x1E90FF,
 }
 
--- ---------- drawing helpers (reset BG after fills to avoid highlight) ----------
 local function put(x, y, s, fg, bg)
   if bg then gpu.setBackground(bg) end
   if fg then gpu.setForeground(fg) end
@@ -64,11 +87,11 @@ local function drawBar(x, y, w, pct, color)
   end
 end
 
--- ---------- title / frame / buttons (your UI) ----------
 local function drawTitle(role, addrStr)
   gpu.setBackground(COL.title); gpu.setForeground(COL.text)
   gpu.fill(1, 1, W, 1, " ")
-  put(3, 1, "ZIRNOX REACTOR • "..role..(addrStr and (" • "..addrStr) or ""), COL.text, COL.title)
+  local label = "ZIRNOX REACTOR • "..role..(addrStr and (" • "..addrStr) or "")
+  put(3, 1, label, COL.text, COL.title)
   gpu.setBackground(COL.bg); gpu.setForeground(COL.text)
 end
 
@@ -104,7 +127,7 @@ local function drawButtons()
   put(ex - 1, y + 1, "└" .. string.rep("─", ew) .. "┘", COL.text)
 end
 
--- ---------- detect reactor (host) ----------
+-- ========================= Reactor (host) =================
 local reactor, reactorAddr
 for addr, t in component.list() do
   if t == "zirnox_reactor" then
@@ -113,119 +136,188 @@ for addr, t in component.list() do
     break
   end
 end
+local ROLE = reactor and "HOST" or "VIEWER"
 
--- ---------- robust reads using official getters with fallback ----------
 local function readZirnox()
-  if not reactor then
-    return 0,0,0,0,0,false,"no reactor component found"
-  end
-
-  -- Preferred: per-field getters (per wiki)
+  if not reactor then return 0,0,0,0,0,false end
+  -- Try per-field getters
   local okT, temp = pcall(reactor.getTemp)
   local okP, pres = pcall(reactor.getPressure)
   local okW, wat  = pcall(reactor.getWater)
   local okC, co2  = pcall(reactor.getCarbonDioxide)
   local okS, stm  = pcall(reactor.getSteam)
   local okA, act  = pcall(reactor.isActive)
-
   if okT and okP and okW and okC and okS and okA then
-    return N(temp), N(pres), N(wat), N(co2), N(stm), B(act), nil
+    return N(temp), N(pres), N(wat), N(co2), N(stm), B(act)
   end
-
-  -- Fallback: getInfo() — handle table or multi-returns
-  local okI, i1, i2, i3, i4, i5, i6 = pcall(reactor.getInfo)
+  -- Fallback to getInfo (table or multiple returns)
+  local okI, a,b,c,d,e,f = pcall(reactor.getInfo)
   if okI then
-    if type(i1) == "table" then
-      local t = i1
+    if type(a)=="table" then
+      local t=a
       return N(t[1] or t.temp), N(t[2] or t.pressure), N(t[3] or t.water),
-             N(t[4] or t.co2 or t.carbon or t["carbon dioxide"]),
-             N(t[5] or t.steam), B(t[6] or t.active), nil
+             N(t[4] or t.co2 or t.carbon), N(t[5] or t.steam), B(t[6] or t.active)
     else
-      return N(i1), N(i2), N(i3), N(i4), N(i5), B(i6), nil
+      return N(a),N(b),N(c),N(d),N(e),B(f)
     end
   end
-
-  return 0,0,0,0,0,false,"no getters/getInfo available"
+  return 0,0,0,0,0,false
 end
 
 local function setActive(on)
-  if not reactor or not reactor.setActive then return "no reactor/setActive" end
-  local ok, err = pcall(reactor.setActive, on and true or false)
-  if not ok then return tostring(err) end
-  return nil
+  if ROLE=="HOST" and reactor and reactor.setActive then
+    pcall(reactor.setActive, on and true or false)
+  end
 end
 
--- ---------- stats drawing (same look) ----------
-local lastDiag = "-"
+-- ========================= Networking =====================
+local NET = { modem=nil, isWireless=false, hostAddr=nil, portOpen=false }
+
+local function openModem()
+  for addr in component.list("modem") do
+    NET.modem = component.proxy(addr); break
+  end
+  if not NET.modem then return end
+  NET.isWireless = (NET.modem.isWireless and NET.modem.isWireless()) or false
+  if NET.isWireless and NET.modem.setStrength then pcall(NET.modem.setStrength, CFG.WIRELESS_RANGE) end
+  if not NET.modem.isOpen(CFG.PORT) then NET.modem.open(CFG.PORT) end
+  NET.portOpen = NET.modem.isOpen(CFG.PORT)
+end
+
+local function send(addr, body)
+  if NET.modem and addr then NET.modem.send(addr, CFG.PORT, wrap(body)) end
+end
+local function bcast(body)
+  if NET.modem and NET.isWireless and NET.modem.broadcast then NET.modem.broadcast(CFG.PORT, wrap(body)) end
+end
+
+local INFO = {temp=0,pres=0,water=0,co2=0,steam=0,active=false}
+
+local function onMsg(_, localAddr, from, port, dist, payload)
+  if port ~= CFG.PORT then return end
+  local ok, msg = pcall(serial.unserialize, payload or "")
+  if not ok or type(msg)~="table" then return end
+  if msg.proto ~= CFG.PROTO then return end
+  if (CFG.SHARED_KEY or false) ~= (msg.key or false) then return end
+  local body = msg.body or {}
+  if type(body)~="table" then return end
+
+  if body.t=="whois" and ROLE=="HOST" then
+    send(from, {t="iam"})
+  elseif body.t=="iam" and ROLE=="VIEWER" then
+    NET.hostAddr = NET.hostAddr or from
+  elseif body.t=="state" and ROLE=="VIEWER" then
+    local i = body.info or {}
+    INFO.temp   = N(i.temp)
+    INFO.pres   = N(i.pres)
+    INFO.water  = N(i.water)
+    INFO.co2    = N(i.co2)
+    INFO.steam  = N(i.steam)
+    INFO.active = B(i.active)
+    if not NET.hostAddr then NET.hostAddr = from end
+  elseif body.t=="cmd" and ROLE=="HOST" then
+    if body.cmd=="setActive" then setActive(body.value==true) end
+  end
+end
+
+openModem()
+event.listen("modem_message", onMsg)
+
+-- ========================= Draw (same look) ===============
 local function drawStats()
-  local temp, pres, water, co2, steam, active, err = readZirnox()
-  if err then lastDiag = err end
+  local temp, pres, water, co2, steam, active
+  if ROLE=="HOST" then
+    temp, pres, water, co2, steam, active = readZirnox()
+    INFO.temp,INFO.pres,INFO.water,INFO.co2,INFO.steam,INFO.active =
+      temp,pres,water,co2,steam,active
+  else
+    temp, pres, water, co2, steam, active =
+      INFO.temp,INFO.pres,INFO.water,INFO.co2,INFO.steam,INFO.active
+  end
 
   local x0, y0 = PAD_X, PAD_Y + 3
   local barW   = W - 2 * PAD_X
 
-  -- temperature row
-  gpu.setForeground(COL.red);   put(x0, y0 + 0, "Temp:")
+  gpu.setForeground(COL.red);   put(x0,     y0 + 0, "Temp:")
   gpu.setForeground(COL.text);  put(x0 + 7, y0 + 0, string.format("%7.2f °C", temp))
   drawBar(x0, y0 + 1, barW, math.min(100, (temp / math.max(1,temp,800))*100), COL.orange)
 
-  -- pressure row
-  gpu.setForeground(COL.blue);  put(x0, y0 + 3, "Pres:")
+  gpu.setForeground(COL.blue);  put(x0,     y0 + 3, "Pres:")
   gpu.setForeground(COL.text);  put(x0 + 7, y0 + 3, string.format("%7.2f BAR", pres))
   drawBar(x0, y0 + 4, barW, math.min(100, (pres / math.max(1,pres,30))*100), COL.cyan)
 
-  -- water/steam/co2
-  gpu.setForeground(COL.teal);  put(x0, y0 + 6, "Water:")
+  gpu.setForeground(COL.teal);  put(x0,     y0 + 6, "Water:")
   gpu.setForeground(COL.text);  put(x0 + 7, y0 + 6, string.format("%6d mB", water))
 
-  gpu.setForeground(COL.teal);  put(x0, y0 + 7, "Steam:")
+  gpu.setForeground(COL.teal);  put(x0,     y0 + 7, "Steam:")
   gpu.setForeground(COL.text);  put(x0 + 7, y0 + 7, string.format("%6d mB", steam))
 
-  gpu.setForeground(COL.teal);  put(x0, y0 + 8, "CO2:")
+  gpu.setForeground(COL.teal);  put(x0,     y0 + 8, "CO2:")
   gpu.setForeground(COL.text);  put(x0 + 7, y0 + 8, string.format("%6d mB", co2))
 
-  -- status
-  gpu.setForeground(COL.teal);  put(x0, y0 + 9, "Status:")
+  gpu.setForeground(COL.teal);  put(x0,     y0 + 9, "Status:")
   if active then gpu.setForeground(COL.green); put(x0 + 8, y0 + 9, "ACTIVE")
   else          gpu.setForeground(COL.bad);   put(x0 + 8, y0 + 9, "INACTIVE") end
 
-  -- tiny diagnostics (one line)
-  gpu.setForeground(COL.dim)
-  put(x0, H - 3, "Diag: "..(reactorAddr and reactorAddr:sub(1,8).."…" or "—").." • "..(lastDiag or "-"))
   gpu.setForeground(COL.text)
 end
 
--- ---------- initial draw ----------
+-- ========================= Initial draw ===================
 clearAll()
-drawTitle(reactor and "HOST" or "VIEWER", reactorAddr and reactorAddr:sub(1,8).."…")
+drawTitle(ROLE, reactorAddr and reactorAddr:sub(1,8).."…")
 drawFrame()
 drawButtons()
+put(PAD_X, PAD_Y, ROLE=="HOST" and "HOST MODE" or "VIEWER")
 
--- mode label
-gpu.setForeground(COL.dim)
-put(PAD_X, PAD_Y, reactor and "HOST MODE" or "VIEWER (no reactor)")
-gpu.setForeground(COL.text)
-
--- ---------- main loop ----------
+-- ========================= Main Loop ======================
+local lastB, lastD = 0, 0
 local running = true
 while running do
-  local ev, a,b,c = event.pull(0.25, "touch")
+  -- host periodic broadcast
+  local now = os.clock()
+  if ROLE=="HOST" and NET.modem and now - lastB >= CFG.BCAST_RATE then
+    local pkt = {t="state", info=INFO}
+    if NET.isWireless and NET.modem.broadcast then
+      NET.modem.broadcast(CFG.PORT, wrap(pkt))
+    end
+    lastB = now
+  end
+
+  -- viewer discovery (broadcast whois or ping locked host)
+  if ROLE=="VIEWER" and NET.modem and now - lastD >= CFG.DISC_RATE then
+    if LOCK_HOST then
+      send(LOCK_HOST, {t="whois"})
+    else
+      bcast({t="whois"})
+    end
+    lastD = now
+  end
+
+  -- draw stats
+  drawStats()
+
+  -- handle input (IMPORTANT: correct touch params)
+  local ev, addr, x, y = event.pull(CFG.TICK, "touch")
   if ev == "touch" then
-    local _,_,x,y = a,b,c
+    -- touch params are: screenAddress, x, y, button, player
     local by, tx, tw, _, ex, ew = layoutButtons()
-    -- Exit
     if y == by and x >= ex and x < ex + ew then
       running = false
-    end
-    -- Toggle
-    if y == by and x >= tx and x < tx + tw then
-      local err = setActive(not B(select(6, readZirnox())))
-      if err then lastDiag = err end
+    elseif y == by and x >= tx and x < tx + tw then
+      -- toggle
+      if ROLE=="HOST" then
+        setActive(not INFO.active)
+      else
+        local dest = NET.hostAddr or LOCK_HOST
+        if dest then
+          send(dest, {t="cmd", cmd="setActive", value=not INFO.active})
+        end
+      end
     end
   elseif ev == "interrupted" then
     running = false
   end
-  drawStats()
 end
 
-clearAll()
+event.ignore("modem_message", onMsg)
+gpu.setBackground(COL.bg); gpu.setForeground(COL.text); term.clear()
