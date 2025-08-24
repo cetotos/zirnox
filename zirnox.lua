@@ -1,24 +1,22 @@
--- Zirnox Reactor UI (OC 1.7.10) — v4
--- - No flicker: static frame drawn once; only small regions update.
--- - Scalable: tweak SCALE.
--- - Viewer discovery + optional manual host lock (--hostaddr=... or HOST_ADDR).
--- - Wireless range set (default 220). No palette-index flags.
--- - Host reads reactor & broadcasts; Viewer mirrors and can toggle via net.
+-- zirnox_fixed.lua  (OC 1.7.10) — no flicker, no highlight bugs, nil-safe, scalable
+-- HOST: has zirnox_reactor; reads + broadcasts
+-- VIEWER: no reactor; shows immediately; listens; can toggle via net
+-- SCALE: set CFG.SCALE to 1.0..3.0
 
--------------------- CONFIG --------------------
+---------------- CONFIG ----------------
 local CFG = {
-  SCALE          = 1.7,       -- 1.0..3.0
+  SCALE          = 1.8,      -- 1.0..3.0 (bigger = larger UI)
   PORT           = 42420,
   PROTO          = "zirnox.v1",
-  SHARED_KEY     = nil,       -- optional pairing key
-  TICK           = 0.25,      -- loop tick
-  REFRESH        = 0.5,       -- UI update cadence (seconds)
-  HOST_BCAST     = 0.5,       -- host broadcast cadence
-  VIEW_DISC      = 2.5,       -- viewer discovery cadence
-  MIN_W          = 70,        -- will not shrink your current res
+  SHARED_KEY     = nil,      -- optional pairing key (set same on both)
+  TICK           = 0.25,     -- loop tick
+  REFRESH        = 0.5,      -- UI update cadence (lower = faster)
+  HOST_BCAST     = 0.5,      -- host broadcast cadence
+  VIEW_DISC      = 2.5,      -- viewer discovery cadence
+  MIN_W          = 70,       -- min resolution to request (won’t shrink)
   MIN_H          = 22,
-  WIRELESS_RANGE = 220,       -- your known modem range
-  HOST_ADDR      = nil,       -- OPTIONAL: set modem addr string here to force-lock viewer
+  WIRELESS_RANGE = 220,      -- your modem range
+  HOST_ADDR      = nil,      -- optional: force viewer to a specific host modem address
   COL = {
     bg      = 0x0B0D10,
     panel   = 0x171B21,
@@ -27,9 +25,9 @@ local CFG = {
     faint   = 0x9AA0A6,
     border  = 0x3B3F46,
     good    = 0x4CAF50,
+    info    = 0x03A9F4,
     warn    = 0xFFC107,
     bad     = 0xF44336,
-    info    = 0x03A9F4,
     btnTxt  = 0xFFFFFF,
     closeBg = 0xE53935,
     closeTx = 0xFFFFFF,
@@ -39,7 +37,7 @@ local CFG = {
   }
 }
 
--------------------- LIBS -----------------------
+---------------- LIBS -------------------
 local component = require("component")
 local event     = require("event")
 local term      = require("term")
@@ -52,28 +50,29 @@ do
   local ok, shell = pcall(require, "shell")
   if ok and shell and shell.parse then
     local _, opts = shell.parse(...)
-    if opts.host   then FORCE = "HOST" end
-    if opts.viewer then FORCE = "VIEWER" end
+    if opts.host     then FORCE = "HOST" end
+    if opts.viewer   then FORCE = "VIEWER" end
     if opts.hostaddr then HOSTADDR = tostring(opts.hostaddr) end
   end
 end
 if HOSTADDR and #HOSTADDR>0 then CFG.HOST_ADDR = HOSTADDR end
 
--------------------- UTIL -----------------------
+---------------- UTIL --------------------
 local COL = CFG.COL
+local function N(v) return tonumber(v) or 0 end
+local function B(v) return v and true or false end
 local function clamp(v,a,b) if v<a then return a elseif v>b then return b else return v end end
-local function round(x,n) n=n or 0 local p=10^n return math.floor(x*p+0.5)/p end
+local function round(x,n) n=n or 0 local p=10^n return math.floor(N(x)*p+0.5)/p end
 local function setBG(c) gpu.setBackground(c) end
 local function setFG(c) gpu.setForeground(c) end
-local function fill(x,y,w,h,ch,bg) if bg then setBG(bg) end gpu.fill(x,y,w,h,ch or " ") end
-local function put(x,y,s,fg,bg) if bg then setBG(bg) end if fg then setFG(fg) end gpu.set(x,y,s) end
+local function fill(x,y,w,h,ch,bg) if bg then setBG(bg) end gpu.fill(x,y,w,h,ch or " ") setBG(COL.bg) end
+local function put(x,y,s,fg,bg) if bg then setBG(bg) end if fg then setFG(fg) end gpu.set(x,y,s) setBG(COL.bg) end
 
 local function bindScreen()
   local scr
   for a in component.list("screen") do scr = scr or a end
   assert(scr, "No screen attached/cabled.")
   assert(pcall(gpu.bind, scr))
-  return scr
 end
 
 local function ensureRes(minW,minH)
@@ -82,14 +81,12 @@ local function ensureRes(minW,minH)
   local nw = (cw<minW) and math.min(mw,minW) or cw
   local nh = (ch<minH) and math.min(mh,minH) or ch
   if nw~=cw or nh~=ch then pcall(gpu.setResolution,nw,nh) end
-  return gpu.getResolution()
 end
 
--------------------- LAYOUT ---------------------
-local L = { }   -- computed
+---------------- LAYOUT ------------------
+local L = { }
 local CLOSE={x=0,y=0,w=0,h=1}
 local TOGGLE={x=0,y=0,w=0,h=0}
-local EXIT={x=0,y=0,w=0,h=0}
 
 local function computeLayout()
   local W,H = gpu.getResolution()
@@ -111,21 +108,18 @@ local function computeLayout()
     stats={x=innerX+2,y=innerY+2,w=leftW-4},
     bars ={x=rightX+2,y=innerY+2,w=rightW-4},
   }
-  -- Clamp bottom widgets to screen
   if L.bottom.x+L.bottom.w-1 > W then L.bottom.w = W-L.bottom.x+1 end
   if L.right.x+L.right.w-1 > W then L.right.w = W-L.right.x+1 end
 end
 
 local function drawBox(x,y,w,h,bg,border)
   if bg then fill(x,y,w,h," ",bg) end
-  if border then
+  if border and w>=2 and h>=2 then
     setFG(border)
-    if w>=2 and h>=2 then
-      gpu.set(x,y,"+"); gpu.set(x+w-1,y,"+")
-      gpu.set(x,y+h-1,"+"); gpu.set(x+w-1,y+h-1,"+")
-      for i=x+1,x+w-2 do gpu.set(i,y,"-"); gpu.set(i,y+h-1,"-") end
-      for j=y+1,y+h-2 do gpu.set(x,j,"|"); gpu.set(x+w-1,j,"|") end
-    end
+    gpu.set(x,y,"+"); gpu.set(x+w-1,y,"+")
+    gpu.set(x,y+h-1,"+"); gpu.set(x+w-1,y+h-1,"+")
+    for i=x+1,x+w-2 do gpu.set(i,y,"-"); gpu.set(i,y+h-1,"-") end
+    for j=y+1,y+h-2 do gpu.set(x,j,"|"); gpu.set(x+w-1,j,"|") end
   end
 end
 
@@ -155,7 +149,7 @@ local function within(mx,my,r)
   return r and mx>=r.x and mx<=r.x+r.w-1 and my>=r.y and my<=r.y+r.h-1
 end
 
--------------------- NET -------------------------
+---------------- NET ----------------------
 local NET = { modem=nil,isWireless=false, hostAddr=nil, portOpen=false, last="init" }
 
 local function openModem()
@@ -164,7 +158,7 @@ local function openModem()
   end
   if not NET.modem then NET.last="no modem"; return end
   NET.isWireless = (NET.modem.isWireless and NET.modem.isWireless()) or false
-  if NET.isWireless and NET.modem.setStrength then pcall(NET.modem.setStrength, CFG.WIRELESS_RANGE) end
+  if NET.isWireless and NET.modem.setStrength then pcall(NET.modem.setStrength, N(CFG.WIRELESS_RANGE)) end
   if not NET.modem.isOpen(CFG.PORT) then NET.modem.open(CFG.PORT) end
   NET.portOpen = NET.modem.isOpen(CFG.PORT)
   NET.last = (NET.isWireless and "wireless " or "wired ").."port "..tostring(CFG.PORT).." open"
@@ -174,7 +168,7 @@ local function wrap(body) return serial.serialize({proto=CFG.PROTO,key=CFG.SHARE
 local function send(addr, body) if NET.modem then NET.modem.send(addr, CFG.PORT, wrap(body)) end end
 local function bcast(body) if NET.modem and NET.isWireless and NET.modem.broadcast then NET.modem.broadcast(CFG.PORT, wrap(body)) end end
 
--------------------- REACTOR ----------------------
+---------------- REACTOR -------------------
 local function findZirnox()
   for addr,t in component.list() do
     if t=="zirnox_reactor" then return component.proxy(addr), addr end
@@ -182,14 +176,15 @@ local function findZirnox()
   return nil,nil
 end
 
--------------------- STATE ------------------------
+---------------- STATE ---------------------
 local ST = {
   role="VIEWER", reactor=nil, raddr=nil,
   info={temp=0,pres=0,water=0,co2=0,steam=0,active=false},
   lastRX=0
 }
 
--------------------- STATIC FRAME -----------------
+---------------- STATIC FRAME --------------
+local lines = { statusY=0, diagY=0, barsY=0 }
 local function drawStaticFrame()
   setBG(COL.bg); setFG(COL.text); term.clear()
   local roleStr = (ST.role=="HOST") and ("HOST • "..(ST.raddr and ST.raddr:sub(1,8).."…" or "no-reactor"))
@@ -199,132 +194,119 @@ local function drawStaticFrame()
   drawBox(L.right.x,L.right.y,L.right.w,L.right.h,COL.panel,COL.border)
   drawBox(L.bottom.x,L.bottom.y,L.bottom.w,L.bottom.h, COL.panel,COL.border)
 
-  -- Bottom buttons (placed once)
-  local midY = L.bottom.y + math.floor(L.bottom.h/2)
-  TOGGLE = button(L.bottom.x+2, midY, "  Toggle Reactor  ")
-  EXIT   = button(L.bottom.x + L.bottom.w - (#"   Exit   ")-4, midY, "   Exit   ")
-  -- make bottom Exit also act as close
-  CLOSE = EXIT
-end
-
--------------------- DYNAMIC UPDATES --------------
-local lines = {
-  statusY = 0, diagY = 0, barsY = 0
-}
-
-local function drawInitLabels()
+  -- labels
   local x, y = L.stats.x, L.stats.y
   put(x,y,"Status",COL.faint); y=y+2
-  lines.statusY = y
-  y = y + 1
-
+  lines.statusY = y; y=y+1
   put(x,y,"Reactor Info",COL.faint); y=y+1
-  put(x,y, "Temperature:"); y=y+1
-  put(x,y, "Pressure:   "); y=y+1
-  put(x,y, "Water:      "); y=y+1
-  put(x,y, "CO2:        "); y=y+1
-  put(x,y, "Steam:      "); y=y+2
+  put(x,y,"Temperature:"); y=y+1
+  put(x,y,"Pressure:   "); y=y+1
+  put(x,y,"Water:      "); y=y+1
+  put(x,y,"CO2:        "); y=y+1
+  put(x,y,"Steam:      "); y=y+2
   put(x,y,"Network",COL.faint); y=y+1
   lines.diagY = y
 
   local bx, by = L.bars.x, L.bars.y
   put(bx, by, "Live Meters", COL.faint); by = by + 2
   lines.barsY = by
+
+  -- buttons
+  local midY = L.bottom.y + math.floor(L.bottom.h/2)
+  TOGGLE = button(L.bottom.x+2, midY, "  Toggle Reactor  ")
+  local EXIT  = button(L.bottom.x + L.bottom.w - (#"   Exit   ")-4, midY, "   Exit   ")
+  CLOSE = EXIT
 end
 
+---------------- DYNAMIC UPDATE ------------
 local lastDraw = { }
 local function updText(x,y,key,str,fg)
   if lastDraw[key] ~= str then
-    -- overwrite line area neatly (pad to end of panel)
-    local maxW = (x + L.left.w - 6) - x + 1
-    if maxW and maxW>0 then
-      local padded = str .. string.rep(" ", math.max(0, maxW - #str))
+    -- erase to panel edge so no leftovers; keep BG default
+    local safeW = math.max(0, (L.left.x+L.left.w-3) - x + 1)
+    if safeW > 0 then
+      local padded = tostring(str)
+      if #padded < safeW then padded = padded .. string.rep(" ", safeW-#padded) end
       put(x,y,padded,fg)
     else
-      put(x,y,str,fg)
+      put(x,y,tostring(str),fg)
     end
     lastDraw[key] = str
   end
 end
 
 local function updBar(x,y,w,key,pct,label,right,fillColor)
-  pct = clamp(pct or 0,0,1)
-  local sig = key..":"..tostring(math.floor(pct*100))..":"..right
+  pct = clamp(N(pct),0,1)
+  local sig = key..":"..tostring(math.floor(pct*100))..":"..tostring(right)
   if lastDraw[key] ~= sig then
-    -- erase line band
-    fill(x,y,w,1," ",COL.panel)
-    -- border
+    fill(x,y,w,1," ",COL.panel)                  -- clear row
     setFG(COL.border); if w>=2 then gpu.set(x,y,"["); gpu.set(x+w-1,y,"]") end
-    -- fill
     if w>2 then
       local filled = math.floor((w-2)*pct+0.5)
-      setBG(fillColor or COL.info)
-      if filled>0 then gpu.fill(x+1,y,filled,1," ") end
+      if filled>0 then setBG(fillColor or COL.info); gpu.fill(x+1,y,filled,1," ") end
     end
-    -- labels above (draw every time for safety)
+    setBG(COL.bg)
     put(x, y-1, label.."        ", COL.faint)
-    put(x+w-#right, y-1, right, COL.faint)
-    setBG(COL.bg); setFG(COL.text)
+    local rx = x+w-#tostring(right)
+    if rx>=x then put(rx, y-1, tostring(right), COL.faint) end
     lastDraw[key] = sig
   end
 end
 
 local function updateUI()
-  -- update title role only when it changes significantly
-  -- (skip: we already draw static once; title is good enough)
-
-  -- left stats
+  -- status
   local x = L.stats.x + 14
   local y = lines.statusY - 1
   local sLabel = ST.info.active and "[ON ] ACTIVE" or "[OFF] STANDBY"
   updText(x,y,"status", sLabel, ST.info.active and COL.good or COL.info)
 
+  -- fields
   y = L.stats.y + 4
-  updText(x,y,  "t", string.format("%s °C", round(ST.info.temp,1)));    y=y+1
-  updText(x,y,  "p", string.format("%s bar", round(ST.info.pres,1)));   y=y+1
-  updText(x,y,  "w", tostring(ST.info.water).." mB");                   y=y+1
-  updText(x,y, "co2", tostring(ST.info.co2).." mB");                    y=y+1
-  updText(x,y,  "s", tostring(ST.info.steam).." mB");                   y=y+2
+  updText(x,y,  "t", string.format("%s °C", round(ST.info.temp,1)));  y=y+1
+  updText(x,y,  "p", string.format("%s bar", round(ST.info.pres,1))); y=y+1
+  updText(x,y,  "w", tostring(N(ST.info.water)).." mB");              y=y+1
+  updText(x,y, "co2", tostring(N(ST.info.co2)).." mB");               y=y+1
+  updText(x,y,  "s", tostring(N(ST.info.steam)).." mB");              y=y+2
 
   -- diagnostics
   local dX = L.stats.x + 14
   local dY = lines.diagY
   local mstr = NET.modem and ((NET.isWireless and "wireless") or "wired") or "none"
-  updText(dX,dY,   "m","Modem: "..mstr);                     dY=dY+1
+  updText(dX,dY,   "m","Modem: "..mstr);                              dY=dY+1
   updText(dX,dY,   "po","Port: "..(NET.portOpen and ("open "..CFG.PORT) or "closed")); dY=dY+1
   if NET.isWireless then updText(dX,dY,"rg","Range: "..tostring(CFG.WIRELESS_RANGE).." blocks"); dY=dY+1 end
-  updText(dX,dY,   "le","Last: "..(NET.last or "-"));        dY=dY+1
+  updText(dX,dY,   "le","Last: "..(NET.last or "-"));                 dY=dY+1
 
-  -- right bars
+  -- bars (auto scale to seen values, but nil-safe)
   local bx, by, bw = L.bars.x, lines.barsY, L.bars.w
-  local maxT = math.max(800, ST.info.temp)
-  local maxP = math.max(30,  ST.info.pres)
-  updBar(bx,by,  bw,"barT", ST.info.temp/maxT, "Temperature", string.format("%d / %d °C", round(ST.info.temp), round(maxT)), COL.info);  by=by+2
-  updBar(bx,by,  bw,"barP", ST.info.pres/maxP, "Pressure   ", string.format("%d / %d bar", round(ST.info.pres), round(maxP)), COL.info); by=by+2
-  updBar(bx,by,  bw,"barW", ST.info.water>0 and 1 or 0, "Water      ", string.format("%d mB", ST.info.water), COL.wBar);                by=by+2
-  updBar(bx,by,  bw,"barC", ST.info.co2>0   and 1 or 0, "CO2        ", string.format("%d mB", ST.info.co2),   COL.cBar);                by=by+2
-  updBar(bx,by,  bw,"barS", ST.info.steam>0 and 1 or 0, "Steam      ", string.format("%d mB", ST.info.steam), COL.sBar);                by=by+2
+  local maxT = math.max(800, N(ST.info.temp))
+  local maxP = math.max(30,  N(ST.info.pres))
+  updBar(bx,by,  bw,"barT", N(ST.info.temp)/maxT, "Temperature", string.format("%d / %d °C", round(ST.info.temp), round(maxT)), COL.info);  by=by+2
+  updBar(bx,by,  bw,"barP", N(ST.info.pres)/maxP, "Pressure   ", string.format("%d / %d bar", round(ST.info.pres), round(maxP)), COL.info); by=by+2
+  updBar(bx,by,  bw,"barW", N(ST.info.water)>0 and 1 or 0, "Water      ", tostring(N(ST.info.water)).." mB", COL.wBar);                     by=by+2
+  updBar(bx,by,  bw,"barC", N(ST.info.co2)>0   and 1 or 0, "CO2        ", tostring(N(ST.info.co2)).." mB",   COL.cBar);                     by=by+2
+  updBar(bx,by,  bw,"barS", N(ST.info.steam)>0 and 1 or 0, "Steam      ", tostring(N(ST.info.steam)).." mB", COL.sBar);                     by=by+2
 end
 
--------------------- REACTOR I/O ---------------
+---------------- REACTOR I/O ---------------
 local function readReactor()
   if not ST.reactor then return end
   local t,p,w,co2,s,act = ST.reactor.getInfo()
-  ST.info.temp   = tonumber(t)   or 0
-  ST.info.pres   = tonumber(p)   or 0
-  ST.info.water  = tonumber(w)   or 0
-  ST.info.co2    = tonumber(co2) or 0
-  ST.info.steam  = tonumber(s)   or 0
-  ST.info.active = (act == true)
+  ST.info.temp   = N(t)
+  ST.info.pres   = N(p)
+  ST.info.water  = N(w)
+  ST.info.co2    = N(co2)
+  ST.info.steam  = N(s)
+  ST.info.active = B(act)
 end
 
 local function setActive(on)
   if ST.role=="HOST" then
-    if ST.reactor then ST.reactor.setActive(on and true or false) end
+    if ST.reactor then pcall(ST.reactor.setActive, B(on)) end
   else
-    if NET.modem and (NET.hostAddr or CFG.HOST_ADDR) then
-      local dest = NET.hostAddr or CFG.HOST_ADDR
-      send(dest, {t="cmd", cmd="setActive", value=(on and true or false)})
+    local dest = NET.hostAddr or CFG.HOST_ADDR
+    if NET.modem and dest then
+      send(dest, {t="cmd", cmd="setActive", value=B(on)})
       NET.last = "sent cmd"
     else
       NET.last = "no host"
@@ -332,34 +314,38 @@ local function setActive(on)
   end
 end
 
--------------------- NETWORK I/O ---------------
+---------------- NETWORK I/O ---------------
 local function onMsg(_, localAddr, from, port, dist, payload)
   if port ~= CFG.PORT then return end
   local ok, msg = pcall(serial.unserialize, payload or "")
-  if not ok or type(msg)~="table" then return end
-  if msg.proto ~= CFG.PROTO then return end
+  if not ok or type(msg)~="table" or msg.proto ~= CFG.PROTO then return end
   if (CFG.SHARED_KEY or false) ~= (msg.key or false) then return end
   local body = msg.body or {}
   if type(body)~="table" then return end
 
   if body.t=="whois" and ST.role=="HOST" then
-    send(from, {t="iam"})
-    NET.last = "reply iam"
+    send(from, {t="iam"}); NET.last="reply iam"
   elseif body.t=="iam" and ST.role=="VIEWER" then
-    NET.hostAddr = NET.hostAddr or from
-    NET.last = "found host"
+    NET.hostAddr = NET.hostAddr or from; NET.last="found host"
   elseif body.t=="state" and ST.role=="VIEWER" then
-    if type(body.info)=="table" then for k,v in pairs(body.info) do ST.info[k]=v end end
+    local ii = body.info or {}
+    ST.info.temp   = N(ii.temp)
+    ST.info.pres   = N(ii.pres)
+    ST.info.water  = N(ii.water)
+    ST.info.co2    = N(ii.co2)
+    ST.info.steam  = N(ii.steam)
+    ST.info.active = B(ii.active)
     ST.lastRX = os.clock(); NET.last="rx state"
     if not NET.hostAddr then NET.hostAddr = from end
   elseif body.t=="cmd" and ST.role=="HOST" then
-    if body.cmd=="setActive" then setActive(body.value and true or false); NET.last="rx cmd" end
+    if body.cmd=="setActive" then setActive(B(body.value)); NET.last="rx cmd" end
   end
 end
 
 local function hostBroadcast(now,lastB)
   if not NET.modem then return lastB end
   if now-lastB >= CFG.HOST_BCAST then
+    send(NET.hostAddr or "", {t="noop"}) -- harmless; keeps channel warm if direct send needed
     bcast({t="state", info=ST.info})
     return now
   end
@@ -368,7 +354,6 @@ end
 
 local function viewerDiscover(now,lastD)
   if not NET.modem then return lastD end
-  -- If we know/force a host address, ping it directly; else broadcast whois
   if CFG.HOST_ADDR and now-lastD >= CFG.VIEW_DISC then
     send(CFG.HOST_ADDR, {t="whois"}); NET.last="whois->hostaddr"; return now
   end
@@ -378,18 +363,24 @@ local function viewerDiscover(now,lastD)
   return lastD
 end
 
--------------------- MAIN -----------------------
+---------------- MAIN ----------------------
+local function findZirnox()
+  for addr,t in component.list() do
+    if t=="zirnox_reactor" then return component.proxy(addr), addr end
+  end
+  return nil,nil
+end
+
 local function main()
   bindScreen()
   ensureRes(CFG.MIN_W, CFG.MIN_H)
 
-  -- Decide role
   if FORCE=="HOST" then
     ST.role="HOST"; local r,a=findZirnox(); ST.reactor,ST.raddr=r,a
   elseif FORCE=="VIEWER" then
     ST.role="VIEWER"
   else
-    local r,a=findZirnox(); if r then ST.role="HOST"; ST.reactor,ST.raddr=r,a end
+    local r,a = findZirnox(); if r then ST.role="HOST"; ST.reactor,ST.raddr=r,a end
   end
 
   openModem()
@@ -397,13 +388,10 @@ local function main()
 
   computeLayout()
   drawStaticFrame()
-  drawInitLabels()
-  updateUI()  -- first paint (no flashing)
+  updateUI()
 
   local running = true
-  local lastB, lastD = 0, 0
-  local lastUI = 0
-
+  local lastB, lastD, lastUI = 0, 0, 0
   while running do
     local ev, a, b, c = event.pull(CFG.TICK, "touch")
     local now = os.clock()
@@ -423,7 +411,7 @@ local function main()
     if ev=="touch" then
       local _,_,x,y = a,b,c
       if within(x,y,TOGGLE) then setActive(not ST.info.active) end
-      if within(x,y,CLOSE) or within(x,y,EXIT) then running=false end
+      if within(x,y,CLOSE)  then running=false end
     elseif ev=="interrupted" then
       running=false
     end
