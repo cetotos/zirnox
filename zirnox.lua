@@ -1,130 +1,203 @@
--- zirnox_ui.lua — OC 1.7.10 friendly, uses your simple GUI style
--- HOST (has zirnox_reactor): reads + broadcasts state over modem
--- VIEWER (no reactor): shows same GUI, listens for state; Toggle sends cmd to HOST
+-- Zirnox Reactor UI (OC 1.7.10) — scalable, sleek, modem-aware (220 block default)
+-- One file for both machines:
+--   HOST  = has zirnox_reactor; reads & broadcasts state over wireless modem
+--   VIEWER= no reactor; draws UI immediately; listens; Toggle sends cmd to Host
 
--------------------------------
--- deps
--------------------------------
+----------------------------- CONFIG -----------------------------
+local CFG = {
+  SCALE          = 1.8,      -- 1.0..3.0 (bigger = larger UI)
+  PORT           = 42420,
+  PROTO          = "zirnox.v1",
+  SHARED_KEY     = nil,      -- optional pairing key (same on both)
+  TICK           = 0.25,     -- UI + logic tick
+  HOST_BCAST     = 0.5,      -- host broadcast cadence
+  VIEW_DISC      = 3.0,      -- viewer discovery cadence
+  MIN_W          = 72,       -- min resolution to request (won't shrink)
+  MIN_H          = 24,
+  WIRELESS_RANGE = 220,      -- your modem range (blocks)
+  COLORS = {
+    bg        = 0x0B0D10,
+    panel     = 0x171B21,
+    title     = 0x2D7DFA,
+    text      = 0xEAECEE,
+    faint     = 0x9AA0A6,
+    border    = 0x3B3F46,
+    good      = 0x4CAF50,
+    warn      = 0xFFC107,
+    bad       = 0xF44336,
+    info      = 0x03A9F4,
+    btnTxt    = 0xFFFFFF,
+    closeBg   = 0xE53935,
+    closeTxt  = 0xFFFFFF,
+    barWater  = 0x4CAF50,
+    barCO2    = 0xFFC107,
+    barSteam  = 0x03A9F4,
+  }
+}
+
+----------------------------- LIBS ------------------------------
 local component = require("component")
 local event     = require("event")
 local term      = require("term")
 local serial    = require("serialization")
-local gpu       = assert(component.gpu, "No GPU found.")
+local gpu       = assert(component.gpu, "GPU required.")
 
--------------------------------
--- config
--------------------------------
-local PORT        = 42420
-local PROTOCOL    = "zirnox.v1"
-local SHARED_KEY  = nil      -- set same string on both to "pair" (or keep nil)
-local REFRESH     = 0.25
-local RES_MIN_W   = 60       -- keep your 60x18 feel, but never shrink a larger screen
-local RES_MIN_H   = 18
-local PAD_X, PAD_Y= 2, 1
+-- optional flags: --host / --viewer
+local FORCE = nil
+do
+  local ok, shell = pcall(require, "shell")
+  if ok and shell and shell.parse then
+    local _, opts = shell.parse(...)
+    if opts.host then FORCE = "HOST" end
+    if opts.viewer then FORCE = "VIEWER" end
+  end
+end
 
--- colors (RGB; DO NOT pass 'true' flag to gpu.set* on 1.7.10)
-local COL = {
-  bg        = 0x000000,
-  panel     = 0x202020,
-  white     = 0xFFFFFF,
-  red       = 0xFF0000,
-  green     = 0x00FF00,
-  blue      = 0x1E90FF,
-  orange    = 0xFF4500,
-  teal      = 0x008080,
-  cyan      = 0x03A9F4,
-  yellow    = 0xFFC107,
-  title     = 0x2D7DFA,
-  border    = 0x777777,
-}
+----------------------------- UTIL ------------------------------
+local COL = CFG.COLORS
+local function clamp(v,a,b) if v<a then return a elseif v>b then return v end return v end
+local function round(x,n) n=n or 0 local p=10^n return math.floor(x*p+0.5)/p end
+local function setBG(c) gpu.setBackground(c) end
+local function setFG(c) gpu.setForeground(c) end
+local function fill(x,y,w,h,ch,bg) if bg then setBG(bg) end gpu.fill(x,y,w,h,ch or " ") end
+local function txt(x,y,s,fg,bg) if bg then setBG(bg) end if fg then setFG(fg) end gpu.set(x,y,s) end
+local function hline(x1,x2,y,ch,fg) if fg then setFG(fg) end if x2>=x1 then gpu.fill(x1,y,x2-x1+1,1,ch or " ") end end
 
--------------------------------
--- gpu/screen binding + res
--------------------------------
-local function bindFirstScreen()
+local function bindScreen()
   local scr
-  for addr in component.list("screen") do scr = scr or addr end
-  assert(scr, "No screen attached/cabled.")
-  local ok, err = pcall(gpu.bind, scr) -- no reset flag in 1.7.10 API; this is fine
-  assert(ok, "gpu.bind failed: "..tostring(err))
+  for a in component.list("screen") do scr = scr or a end
+  assert(scr, "No screen attached. Place a Screen + cable.")
+  assert(pcall(gpu.bind, scr))
   return scr
 end
 
-local function setResolutionAtLeast(wNeed, hNeed)
-  local cw, ch = gpu.getResolution()
-  local mw, mh = gpu.maxResolution()
-  local nw = cw < wNeed and math.min(mw, wNeed) or cw
-  local nh = ch < hNeed and math.min(mh, hNeed) or ch
+local function ensureRes(minW, minH)
+  local cw,ch = gpu.getResolution()
+  local mw,mh = gpu.maxResolution()
+  local nw = (cw < minW) and math.min(mw, minW) or cw
+  local nh = (ch < minH) and math.min(mh, minH) or ch
   if nw ~= cw or nh ~= ch then pcall(gpu.setResolution, nw, nh) end
   return gpu.getResolution()
 end
 
-local function clearAll(bg)
-  gpu.setBackground(bg or COL.bg)
-  gpu.setForeground(COL.white)
-  term.clear()
-  term.setCursor(1,1)
+---------------------------- LAYOUT -----------------------------
+local L = {}
+local function computeLayout()
+  local W,H = gpu.getResolution()
+  local S   = CFG.SCALE
+  local pad = math.max(2, math.floor(2*S))
+  local innerX, innerY = 2, 3
+  local innerW, innerH = W-2, H-3-1
+  local leftW  = clamp(math.floor(innerW * (0.40 + 0.06*(S-1))), 30, innerW-20)
+  local rightW = innerW - leftW - pad
+  local rightX = innerX + leftW + pad
+  local btnH   = math.max(3, math.floor(3*S))
+  L = {
+    W=W,H=H,S=S,pad=pad,
+    title   ={x=1,y=1,w=W,h=1},
+    left    ={x=innerX,y=innerY,w=leftW, h=innerH-btnH-pad},
+    right   ={x=rightX,y=innerY,w=rightW,h=innerH-btnH-pad},
+    bottom  ={x=innerX,y=innerY+innerH-btnH,w=innerW,h=btnH},
+    bars    ={x=rightX+2,y=innerY+2,w=rightW-4},
+    stats   ={x=innerX+2,y=innerY+2,w=leftW-4},
+  }
 end
 
--------------------------------
--- small drawing helpers
--------------------------------
-local function drawText(x, y, txt, fg, bg)
-  if bg then gpu.setBackground(bg) end
-  if fg then gpu.setForeground(fg) end
-  gpu.set(x, y, txt)
-end
+local CLOSE = {x=0,y=0,w=0,h=1}
+local TOGGLE= {x=0,y=0,w=0,h=0}
 
-local function drawHLine(x1, x2, y, ch, fg)
-  if fg then gpu.setForeground(fg) end
-  local w = math.max(0, x2 - x1 + 1)
-  if w > 0 then gpu.fill(x1, y, w, 1, ch or "-") end
-end
-
-local function drawPanel(x, y, w, h)
-  gpu.setBackground(COL.panel)
-  gpu.fill(x, y, w, h, " ")
-  gpu.setBackground(COL.bg) -- restore for text
-end
-
-local function drawBar(x, y, w, pct, fillColor)
-  pct = math.max(0, math.min(100, pct or 0))
-  local fill = math.floor(w * pct / 100)
-  gpu.setBackground(COL.panel)
-  gpu.fill(x, y, w, 1, " ")
-  if fill > 0 then
-    gpu.setBackground(fillColor or COL.cyan)
-    gpu.fill(x, y, fill, 1, " ")
+local function box(x,y,w,h,bg,border)
+  if bg then fill(x,y,w,h," ",bg) end
+  if border then
+    setFG(border)
+    gpu.set(x,y,"+"); gpu.set(x+w-1,y,"+")
+    gpu.set(x,y+h-1,"+"); gpu.set(x+w-1,y+h-1,"+")
+    for i=x+1,x+w-2 do gpu.set(i,y,"-"); gpu.set(i,y+h-1,"-") end
+    for j=y+1,y+h-2 do gpu.set(x,j,"|"); gpu.set(x+w-1,j,"|") end
   end
-  gpu.setBackground(COL.bg)
-  gpu.setForeground(COL.white)
 end
 
--------------------------------
--- modem utils
--------------------------------
-local function haveModem()
-  for _ in component.list("modem") do return true end
-  return false
+local function titleBar(roleStr)
+  local t = L.title
+  fill(t.x,t.y,t.w,1," ",COL.title)
+  txt(t.x+2,t.y,"ZIRNOX REACTOR • "..roleStr, COL.text, COL.title)
+  local label = "[  X  ]"
+  local cw = #label
+  local cx = t.x + t.w - cw
+  fill(cx,t.y,cw,1," ",COL.closeBg)
+  txt(cx+1,t.y,label, COL.closeTxt, COL.closeBg)
+  CLOSE = {x=cx,y=t.y,w=cw,h=1}
 end
 
-local function openPort()
-  local m
+local function button(x,y,label)
+  local w = #label + 2
+  txt(x,   y-1, "+"..string.rep("-", w-2).."+", COL.text)
+  txt(x,   y,   "|"..label.."|",                COL.btnTxt)
+  txt(x,   y+1, "+"..string.rep("-", w-2).."+", COL.text)
+  return {x=x,y=y,w=w,h=3}
+end
+
+local function statLine(x,y,k,v,kv)
+  kv = kv or 13
+  txt(x, y, string.format("%-"..kv.."s", k), COL.faint)
+  txt(x+kv+1, y, v, COL.text)
+end
+
+local function bar(x,y,w,pct,label,right,fillColor)
+  pct = clamp(pct or 0,0,1)
+  fill(x,y,w,1," ",COL.panel)
+  if w>2 then
+    local filled = math.floor((w-2) * pct + 0.5)
+    setBG(fillColor or COL.info)
+    if filled>0 then gpu.fill(x+1,y,filled,1," ") end
+  end
+  setFG(COL.border); if w>=2 then gpu.set(x,y,"["); gpu.set(x+w-1,y,"]") end
+  txt(x, y-1, label, COL.faint)
+  local rx = x+w-#right
+  if rx>=x then txt(rx, y-1, right, COL.faint) end
+  setBG(COL.bg); setFG(COL.text)
+end
+
+local function within(mx,my,r)
+  return r and mx>=r.x and mx<=r.x+r.w-1 and my>=r.y and my<=r.y+r.h-1
+end
+
+---------------------------- NET -------------------------------
+local NET = { modem=nil, isWireless=false, hostAddr=nil, last="init", portOpen=false, range=0 }
+
+local function openModem()
   for addr in component.list("modem") do
-    m = component.proxy(addr); break
+    local m = component.proxy(addr)
+    NET.modem = m; break
   end
-  if not m then return nil, "no modem" end
-  if not m.isOpen(PORT) then m.open(PORT) end
-  return m
+  if not NET.modem then NET.last="no modem"; return end
+  NET.isWireless = (NET.modem.isWireless and NET.modem.isWireless()) or false
+  if NET.isWireless and NET.modem.setStrength then
+    local r = tonumber(CFG.WIRELESS_RANGE) or 0
+    if r>0 then pcall(NET.modem.setStrength, r); NET.range = r end
+  end
+  if not NET.modem.isOpen(CFG.PORT) then NET.modem.open(CFG.PORT) end
+  NET.portOpen = NET.modem.isOpen(CFG.PORT)
+  NET.last = (NET.isWireless and "wireless" or "wired").." port "..tostring(CFG.PORT).." open"
 end
 
 local function wrap(body)
-  return serial.serialize({proto=PROTOCOL, key=SHARED_KEY, body=body})
+  return serial.serialize({proto=CFG.PROTO, key=CFG.SHARED_KEY, body=body})
 end
 
--------------------------------
--- reactor detect
--------------------------------
+local function send(addr, body)
+  if NET.modem then NET.modem.send(addr, CFG.PORT, wrap(body)) end
+end
+
+local function bcast(body)
+  if not NET.modem then return end
+  local pay = wrap(body)
+  if NET.isWireless and NET.modem.broadcast then
+    NET.modem.broadcast(CFG.PORT, pay)
+  end
+end
+
+--------------------------- REACTOR ----------------------------
 local function findZirnox()
   for addr, t in component.list() do
     if t == "zirnox_reactor" then
@@ -134,284 +207,188 @@ local function findZirnox()
   return nil, nil
 end
 
--------------------------------
--- state
--------------------------------
-local STATE = {
-  role          = "VIEWER", -- or "HOST"
-  reactor       = nil,
-  reactorAddr   = nil,
-  modem         = nil,
-  hostAddr      = nil,
-  info = {
-    temp=0, pres=0, water=0, steam=0, co2=0, active=false
-  },
-  W=60, H=18,
-  -- buttons (computed)
-  btnY=0, btnToggleX=0, btnToggleW=0, btnExitX=0, btnExitW=0,
-  diag = { last="init", portOpen=false, modemKind="none" }
+----------------------------- STATE ----------------------------
+local ST = {
+  role      = "VIEWER",     -- or "HOST"
+  reactor   = nil,
+  raddr     = nil,
+  hostAddr  = nil,
+  info      = {temp=0, pres=0, water=0, co2=0, steam=0, active=false},
+  lastRX    = 0,
 }
 
--------------------------------
--- frame like your sample
--------------------------------
-local function layout()
-  local W,H = gpu.getResolution()
-  STATE.W, STATE.H = W, H
-  local btnToggleLabel = "[ Toggle Reactor ]"
-  local btnExitLabel   = "[ X ]"
-  STATE.btnToggleW = #btnToggleLabel
-  STATE.btnExitW   = #btnExitLabel
-  STATE.btnY       = H - PAD_Y
-  STATE.btnToggleX = PAD_X
-  STATE.btnExitX   = W - PAD_X - STATE.btnExitW + 1
-  return btnToggleLabel, btnExitLabel
+------------------------------ UI ------------------------------
+local function drawAll()
+  local roleStr = (ST.role=="HOST") and ("HOST • "..(ST.raddr and (ST.raddr:sub(1,8).."…") or "no-reactor"))
+                                or ("VIEWER • "..(NET.hostAddr and ("host "..NET.hostAddr:sub(1,8).."…") or "searching…"))
+  -- backdrop
+  fill(1,1,L.W,L.H," ",COL.bg)
+
+  -- frame
+  titleBar(roleStr)
+  box(L.left.x,  L.left.y,  L.left.w,  L.left.h,  COL.panel, COL.border)
+  box(L.right.x, L.right.y, L.right.w, L.right.h, COL.panel, COL.border)
+  box(L.bottom.x,L.bottom.y,L.bottom.w,L.bottom.h,COL.panel, COL.border)
+
+  -- left: stats + diagnostics
+  local x, y = L.stats.x, L.stats.y
+  txt(x, y, "Status", COL.faint); y=y+1
+  local sLabel = ST.info.active and "[ON ] ACTIVE" or "[OFF] STANDBY"
+  local sColor = ST.info.active and COL.good or COL.info
+  txt(x, y, sLabel, sColor); y=y+2
+
+  txt(x, y, "Reactor Info", COL.faint); y=y+1
+  statLine(x,y, "Temperature:", string.format("%s °C", round(ST.info.temp,1))); y=y+1
+  statLine(x,y, "Pressure:",    string.format("%s bar", round(ST.info.pres,1))); y=y+1
+  statLine(x,y, "Water:",       tostring(ST.info.water).." mB"); y=y+1
+  statLine(x,y, "CO2:",         tostring(ST.info.co2).." mB"); y=y+1
+  statLine(x,y, "Steam:",       tostring(ST.info.steam).." mB"); y=y+2
+
+  txt(x, y, "Network", COL.faint); y=y+1
+  statLine(x,y, "Modem:", NET.modem and ((NET.isWireless and "wireless") or "wired") or "none"); y=y+1
+  statLine(x,y, "Port:",  NET.portOpen and ("open "..CFG.PORT) or "closed"); y=y+1
+  if NET.isWireless then statLine(x,y, "Range:", tostring(NET.range or 0).." blocks"); y=y+1 end
+  statLine(x,y, "Last:",  NET.last or "-"); y=y+1
+
+  -- right: bars
+  local bx, by, bw = L.bars.x, L.bars.y, L.bars.w
+  local function pct(v,m) m=(m==0 and 1 or m); return clamp(v/m,0,1) end
+  local maxT, maxP = math.max(800, ST.info.temp), math.max(30, ST.info.pres) -- auto scale
+  txt(bx, by, "Live Meters", COL.faint); by=by+2
+  bar(bx, by, bw, pct(ST.info.temp, maxT),   "Temperature", string.format("%d / %d °C", round(ST.info.temp), round(maxT)), COL.info);  by=by+2
+  bar(bx, by, bw, pct(ST.info.pres, maxP),   "Pressure",    string.format("%d / %d bar", round(ST.info.pres), round(maxP)), COL.info); by=by+2
+  bar(bx, by, bw, pct(ST.info.water, math.max(1,ST.info.water)), "Water", string.format("%d mB", ST.info.water), COL.barWater); by=by+2
+  bar(bx, by, bw, pct(ST.info.co2,   math.max(1,ST.info.co2)),   "CO2",   string.format("%d mB", ST.info.co2),   COL.barCO2);   by=by+2
+  bar(bx, by, bw, pct(ST.info.steam, math.max(1,ST.info.steam)), "Steam", string.format("%d mB", ST.info.steam), COL.barSteam); by=by+2
+
+  -- bottom: buttons
+  local midY = L.bottom.y + math.floor(L.bottom.h/2)
+  local lbl = ST.info.active and " Stop Reactor " or " Start Reactor "
+  TOGGLE = button(L.bottom.x+2, midY, lbl)
+  local EXIT = button(L.bottom.x + L.bottom.w - (#"[  Exit  ]")+4, midY, "  Exit  ")
+  -- store exit rect into CLOSE too (click bottom Exit also quits)
+  CLOSE = {x=EXIT.x, y=EXIT.y, w=EXIT.w, h=EXIT.h}
 end
 
-local function drawFrame()
-  local W,H = STATE.W, STATE.H
-  clearAll(COL.bg)
-
-  -- title
-  local titleRole = (STATE.role == "HOST" and ("HOST • "..(STATE.reactorAddr and STATE.reactorAddr:sub(1,8).."…" or "no-reactor")))
-                 or  ("VIEWER • "..(STATE.hostAddr and ("host "..STATE.hostAddr:sub(1,8).."…") or "searching…"))
-  local title = " Zirnox Reactor Monitor — "..titleRole.." "
-  local titleX = math.floor((W - #title) / 2) + 1
-  drawText(titleX, PAD_Y, title, COL.white)
-
-  -- separator
-  drawHLine(PAD_X, W-PAD_X, PAD_Y+1, "-", COL.border)
-
-  -- diagnostics panel background (left block feel)
-  drawPanel(PAD_X, PAD_Y+2, math.min(28, W-2*PAD_X), 12)
-
-  -- buttons (box-like)
-  local btnToggleLabel, btnExitLabel = layout()
-  drawText(STATE.btnToggleX - 1, STATE.btnY - 1, "+" .. string.rep("-", STATE.btnToggleW) .. "+", COL.white)
-  drawText(STATE.btnToggleX - 1, STATE.btnY,     "|" .. btnToggleLabel .. "|", COL.white)
-  drawText(STATE.btnToggleX - 1, STATE.btnY + 1, "+" .. string.rep("-", STATE.btnToggleW) .. "+", COL.white)
-
-  drawText(STATE.btnExitX   - 1, STATE.btnY - 1, "+" .. string.rep("-", STATE.btnExitW) .. "+", COL.white)
-  drawText(STATE.btnExitX   - 1, STATE.btnY,     "|" .. btnExitLabel   .. "|", COL.white)
-  drawText(STATE.btnExitX   - 1, STATE.btnY + 1, "+" .. string.rep("-", STATE.btnExitW) .. "+", COL.white)
+-------------------------- REACTOR I/O --------------------------
+local function readReactor()
+  if not ST.reactor then return end
+  local t,p,w,co2,s,act = ST.reactor.getInfo()
+  ST.info.temp   = tonumber(t)   or 0
+  ST.info.pres   = tonumber(p)   or 0
+  ST.info.water  = tonumber(w)   or 0
+  ST.info.co2    = tonumber(co2) or 0
+  ST.info.steam  = tonumber(s)   or 0
+  ST.info.active = (act == true)
 end
 
-local function drawStats()
-  local W = STATE.W
-  local x0, y0 = PAD_X+1, PAD_Y + 3
-  local barW   = W - 2 * PAD_X
-
-  -- extract info (already converted if host; otherwise mirrored as-is)
-  local tempC     = STATE.info.temp or 0
-  local pressureB = STATE.info.pres or 0
-  local water     = STATE.info.water or 0
-  local steam     = STATE.info.steam or 0
-  local co2       = STATE.info.co2 or 0
-  local active    = STATE.info.active and true or false
-
-  -- percentages (rough scale; bars are just UI)
-  local pctT = math.max(0, math.min(100, (tempC / 800)*100))
-  local pctP = math.max(0, math.min(100, (pressureB / 30)*100))
-
-  -- Temp
-  drawText(x0,     y0 + 0, "Temp:", COL.red)
-  drawText(x0 + 7, y0 + 0, string.format("%7.2f \194\176C (%5.1f%%)", tempC, pctT), COL.white)
-  drawBar(x0,      y0 + 1, barW, pctT, COL.orange)
-
-  -- Pressure
-  drawText(x0,     y0 + 3, "Pres:", COL.blue)
-  drawText(x0 + 7, y0 + 3, string.format("%7.2f BAR (%5.1f%%)", pressureB, pctP), COL.white)
-  drawBar(x0,      y0 + 4, barW, pctP, COL.blue)
-
-  -- Water
-  drawText(x0,     y0 + 6, "Water:", COL.teal)
-  drawText(x0 + 7, y0 + 6, string.format("%6d mB", water), COL.white)
-
-  -- Steam
-  drawText(x0,     y0 + 7, "Steam:", COL.teal)
-  drawText(x0 + 7, y0 + 7, string.format("%6d mB", steam), COL.white)
-
-  -- CO2
-  drawText(x0,     y0 + 8, "CO2:", COL.teal)
-  drawText(x0 + 7, y0 + 8, string.format("%6d mB", co2), COL.white)
-
-  -- Status
-  drawText(x0,     y0 + 9, "Status:", COL.yellow)
-  drawText(x0 + 8, y0 + 9, active and "ACTIVE" or "INACTIVE", active and COL.green or COL.red)
-
-  -- Diagnostics (left block area)
-  local dY = y0 + 11
-  drawText(x0, dY,     "Diag:", COL.yellow)
-  drawText(x0+7, dY,   (STATE.diag.modemKind or "none")..", port "..(STATE.diag.portOpen and "open" or "closed")..", "..(STATE.diag.last or "-"), COL.white)
-end
-
--------------------------------
--- read reactor (HOST)
--------------------------------
-local function hostReadReactor()
-  if not STATE.reactor then return end
-  -- NTM returns: {Temperature, Pressure, Water, CO2, Steam, Active}
-  local t,p,w,co2,s,act = STATE.reactor.getInfo()
-  -- your sample did a conversion; wiki doesn’t define scaling, so treat as direct.
-  -- If your reactor returns raw scalars, you can convert here. For now assume direct.
-  STATE.info.temp  = tonumber(t)   or 0
-  STATE.info.pres  = tonumber(p)   or 0
-  STATE.info.water = tonumber(w)   or 0
-  STATE.info.co2   = tonumber(co2) or 0
-  STATE.info.steam = tonumber(s)   or 0
-  STATE.info.active= (act == true)
-end
-
--------------------------------
--- networking (send/recv)
--------------------------------
-local function hostBroadcast()
-  if not STATE.modem then return end
-  local payload = wrap({t="state", info=STATE.info})
-  if STATE.modem.isWireless and STATE.modem.isWireless() and STATE.modem.broadcast then
-    STATE.modem.broadcast(PORT, payload)
+local function setActive(on)
+  if ST.role == "HOST" then
+    if ST.reactor then ST.reactor.setActive(on and true or false) end
   else
-    -- wired: we can’t broadcast; nothing else to do unless we learned a hostAddr
+    if NET.modem and NET.hostAddr then
+      send(NET.hostAddr, {t="cmd", cmd="setActive", value=(on and true or false)})
+      NET.last = "sent cmd toggle"
+    else
+      NET.last = "no host"
+    end
   end
-  STATE.diag.last = "broadcast state"
 end
 
-local function viewerDiscover()
-  if not STATE.modem then return end
-  local payload = wrap({t="whois"})
-  if STATE.modem.isWireless and STATE.modem.isWireless() and STATE.modem.broadcast then
-    STATE.modem.broadcast(PORT, payload)
-  end
-  STATE.diag.last = "sent whois"
-end
-
-local function onModemMessage(_, localAddr, from, port, distance, payload)
-  if port ~= PORT then return end
+----------------------------- NET I/O --------------------------
+local function onMsg(_, localAddr, from, port, dist, payload)
+  if port ~= CFG.PORT then return end
   local ok, msg = pcall(serial.unserialize, payload or "")
   if not ok or type(msg)~="table" then return end
-  if msg.proto ~= PROTOCOL then return end
-  if (SHARED_KEY or false) ~= (msg.key or false) then return end
+  if msg.proto ~= CFG.PROTO then return end
+  if (CFG.SHARED_KEY or false) ~= (msg.key or false) then return end
   local body = msg.body or {}
   if type(body) ~= "table" then return end
 
-  if body.t == "whois" and STATE.role == "HOST" then
-    STATE.modem.send(from, PORT, wrap({t="iam"}))
-    STATE.diag.last = "reply iam"
-  elseif body.t == "iam" and STATE.role == "VIEWER" then
-    STATE.hostAddr = from
-    STATE.diag.last = "found host"
-  elseif body.t == "state" and STATE.role == "VIEWER" then
-    if type(body.info) == "table" then
-      for k,v in pairs(body.info) do STATE.info[k] = v end
-      STATE.diag.last = "rx state"
-    end
-  elseif body.t == "cmd" and STATE.role == "HOST" then
-    if body.cmd == "setActive" then
-      if STATE.reactor then STATE.reactor.setActive(body.value and true or false) end
-      STATE.diag.last = "rx cmd"
-    end
+  if body.t == "whois" and ST.role == "HOST" then
+    send(from, {t="iam"})
+    NET.last = "reply iam"
+  elseif body.t == "iam" and ST.role == "VIEWER" then
+    NET.hostAddr = from
+    NET.last = "found host"
+  elseif body.t == "state" and ST.role == "VIEWER" then
+    if type(body.info)=="table" then for k,v in pairs(body.info) do ST.info[k]=v end end
+    ST.lastRX = os.clock(); NET.last = "rx state"
+  elseif body.t == "cmd" and ST.role == "HOST" then
+    if body.cmd == "setActive" then setActive(body.value and true or false) ; NET.last="rx cmd" end
   end
 end
 
--------------------------------
--- toggle action
--------------------------------
-local function toggleActive()
-  if STATE.role == "HOST" then
-    if STATE.reactor then
-      local new = not STATE.info.active
-      STATE.reactor.setActive(new)
-      STATE.info.active = new
-    end
-  else
-    if STATE.modem and STATE.hostAddr then
-      STATE.modem.send(STATE.hostAddr, PORT, wrap({t="cmd", cmd="setActive", value=not STATE.info.active}))
-      STATE.diag.last = "sent cmd"
-    else
-      STATE.diag.last = "no host"
-    end
+local function hostBroadcast(now, lastB)
+  if not NET.modem then return lastB end
+  if now - lastB >= CFG.HOST_BCAST then
+    bcast({t="state", info=ST.info})
+    return now
   end
+  return lastB
 end
 
--------------------------------
--- main
--------------------------------
+local function viewerDiscover(now, lastD)
+  if not NET.modem then return lastD end
+  if not NET.hostAddr and now - lastD >= CFG.VIEW_DISC then
+    bcast({t="whois"})
+    NET.last = "sent whois"
+    return now
+  end
+  return lastD
+end
+
+------------------------------ MAIN ----------------------------
 local function main()
-  -- bind & resolution
-  local scr = bindFirstScreen()
-  local W,H = setResolutionAtLeast(RES_MIN_W, RES_MIN_H)
+  bindScreen()
+  ensureRes(CFG.MIN_W, CFG.MIN_H)
+  setBG(COL.bg); setFG(COL.text); term.clear()
 
-  -- pick role
-  local r, addr = findZirnox()
-  if r then
-    STATE.role = "HOST"
-    STATE.reactor = r
-    STATE.reactorAddr = addr
+  -- role
+  if FORCE == "HOST" then
+    ST.role = "HOST"
+    local r,a = findZirnox(); ST.reactor, ST.raddr = r,a
+  elseif FORCE == "VIEWER" then
+    ST.role = "VIEWER"
   else
-    STATE.role = "VIEWER"
+    local r,a = findZirnox()
+    if r then ST.role, ST.reactor, ST.raddr = "HOST", r, a else ST.role = "VIEWER" end
   end
 
-  -- modem
-  if haveModem() then
-    STATE.modem = assert(openPort())
-    STATE.diag.portOpen = true
-    STATE.diag.modemKind = (STATE.modem.isWireless and STATE.modem.isWireless()) and "wireless" or "wired"
-  else
-    STATE.diag.portOpen = false
-    STATE.diag.modemKind = "none"
-  end
+  openModem()
+  event.listen("modem_message", onMsg)
 
-  -- draw immediately
-  layout()
-  drawFrame()
-  drawStats()
+  computeLayout()
+  drawAll()
 
-  -- subscribe to modem messages
-  event.listen("modem_message", onModemMessage)
-
-  local tDiscover = 0
-  local tBroadcast = 0
-  local lastTick = os.clock()
-
-  while true do
-    local ev, _, x, y = event.pull(REFRESH, "touch")
-    -- logic ticks
+  local running = true
+  local lastB, lastD = 0, 0
+  while running do
+    local ev, a,b,c = event.pull(CFG.TICK, "touch")
     local now = os.clock()
-    if STATE.role == "HOST" then
-      hostReadReactor()
-      if STATE.modem and now - tBroadcast >= 0.5 then
-        hostBroadcast()
-        tBroadcast = now
-      end
+
+    if ST.role == "HOST" then
+      readReactor()
+      lastB = hostBroadcast(now, lastB)
     else
-      if STATE.modem and not STATE.hostAddr and now - tDiscover >= 3.0 then
-        viewerDiscover()
-        tDiscover = now
-      end
+      lastD = viewerDiscover(now, lastD)
     end
 
-    -- redraw
-    drawFrame()
-    drawStats()
+    computeLayout()
+    drawAll()
 
     if ev == "touch" then
-      -- toggle?
-      if y == STATE.btnY and x >= STATE.btnToggleX and x < STATE.btnToggleX + STATE.btnToggleW then
-        toggleActive()
-      end
-      -- exit?
-      if y == STATE.btnY and x >= STATE.btnExitX and x < STATE.btnExitX + STATE.btnExitW then
-        break
-      end
+      local _,_, x,y = a,b,c
+      if within(x,y,TOGGLE) then setActive(not ST.info.active) end
+      if within(x,y,CLOSE)  then running=false end
+    elseif ev == "interrupted" then
+      running=false
     end
   end
 
-  -- cleanup
-  event.ignore("modem_message", onModemMessage)
-  clearAll(COL.bg)
+  event.ignore("modem_message", onMsg)
+  setBG(COL.bg); setFG(COL.text); term.clear()
 end
 
 local ok, err = pcall(main)
-if not ok then
-  io.stderr:write("Fatal error: "..tostring(err).."\n")
-end
+if not ok then io.stderr:write("Fatal error: "..tostring(err).."\n") end
